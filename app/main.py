@@ -12,7 +12,8 @@ from .planner import InfeasibleArrangement, SolverTimeout, plan_layout
 from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
-from .schemas import ArrangeRequest, BlindRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
+from .release import ReleaseInvalid, batch_release
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -110,6 +111,26 @@ async def spatial_qc_invalid_handler(request: Request, exc: SpatialQCInvalid) ->
             "no partial conclusion was produced.",
             "infeasibility_categories": exc.categories,
             "messages": exc.messages,
+        },
+    )
+
+
+@app.exception_handler(ReleaseInvalid)
+async def release_invalid_handler(request: Request, exc: ReleaseInvalid) -> JSONResponse:
+    # 422: the scan does not agree with the plan (missing/unplanned samples,
+    # open/closed-loop misplacement, blocked-well occupancy...) or the
+    # spatial QC input is structurally unanalysable. The problem categories
+    # and the misplaced-well list are returned; no release verdict is given.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "The batch cannot be released; the scan does not match "
+            "the plan (or the request is inconsistent), and no release "
+            "conclusion was produced.",
+            "infeasibility_categories": exc.categories,
+            "messages": exc.messages,
+            "misplaced_wells": exc.misplaced_wells,
+            "cycles": exc.cycles,
         },
     )
 
@@ -260,6 +281,18 @@ async def reconcile_arrangement(req: ReconcileRequest) -> dict:
 )
 async def spatial_qc_arrangement(req: SpatialQCRequest) -> dict:
     return spatial_qc(req)
+
+
+@app.post(
+    "/api/v1/arrangements/batch-release",
+    summary="批次放行核验:先核对扫描与计划完全一致,再以空间质控门控放行",
+    responses={
+        200: {"description": "扫描吻合且空间质控全部达标返回 RELEASED;否则返回 NOT_RELEASED 及原因,不输出部分结论"},
+        422: {"description": "扫描与计划不一致(缺孔/计划外样本/错位/禁用孔占用)或请求非法,列出问题类别与错孔清单,不给放行结论"},
+    },
+)
+async def batch_release_arrangement(req: BatchReleaseRequest) -> dict:
+    return batch_release(req)
 
 
 @app.post(

@@ -335,6 +335,22 @@ def _centred_values(data: _ValidData) -> dict[tuple[int, int], float]:
     }
 
 
+def observed_polish(req: SpatialQCRequest) -> PolishResult:
+    """Run the observed (non-permuted) median polish only.
+
+    Runs the same preflight and polish as :func:`spatial_qc` without any
+    permutation replicates; structural failures propagate as
+    :class:`SpatialQCInvalid` exactly as in the full pipeline. The returned
+    :class:`PolishResult` records whether the observed data itself converged
+    (a full run may still fail later on a permutation replicate).
+    """
+    data = _preflight(req)
+    centred = _centred_values(data)
+    return _median_polish(
+        centred, data.rows, data.cols, req.tolerance, req.max_iterations
+    )
+
+
 def spatial_qc(req: SpatialQCRequest) -> dict:
     """Validate, polish, permute and assemble the spatial QC response."""
     data = _preflight(req)

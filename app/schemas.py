@@ -37,6 +37,17 @@ VIOLATION_SPATIAL_GROUP_INSUFFICIENT = "SPATIAL_GROUP_INSUFFICIENT"
 VIOLATION_SPATIAL_GRID_INSUFFICIENT = "SPATIAL_GRID_INSUFFICIENT"
 VIOLATION_SPATIAL_NOT_CONVERGED = "SPATIAL_NOT_CONVERGED"
 
+# Categories reported in 422 responses of the batch release endpoint when the
+# scanned plate does not agree with the planned layout (stage 1 of release).
+VIOLATION_CLOSED_LOOP_MISPLACEMENT = "CLOSED_LOOP_MISPLACEMENT"
+VIOLATION_SCAN_LAYOUT_MISMATCH = "SCAN_LAYOUT_MISMATCH"
+
+# Reasons reported (in ``reasons``) when the scan matched but the spatial QC
+# release gates are not all satisfied; the batch is then NOT_RELEASED.
+RELEASE_REASON_SPATIAL_EFFECT_EXCEEDED = "SPATIAL_EFFECT_EXCEEDED"
+RELEASE_REASON_P_VALUE_BELOW_THRESHOLD = "P_VALUE_BELOW_THRESHOLD"
+RELEASE_REASON_P_VALUE_UNAVAILABLE = "P_VALUE_UNAVAILABLE"
+
 # Categories reported in 422 responses of the blinding endpoints.
 VIOLATION_BLIND_WELLS_DUPLICATED = "BLIND_WELLS_DUPLICATED"
 VIOLATION_BLIND_SAMPLE_WELL_MISMATCH = "BLIND_SAMPLE_WELL_MISMATCH"
@@ -164,6 +175,83 @@ class SpatialQCRequest(BaseModel):
     max_iterations: int = Field(
         default=1000, ge=1, description="行列交替剥离的最大轮数"
     )
+
+    @field_validator("tolerance")
+    @classmethod
+    def _tolerance_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("tolerance must be a finite number")
+        return v
+
+    @field_validator("readings")
+    @classmethod
+    def _readings_finite(cls, v: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
+        for well, value in v.items():
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"reading at well '{well}' must be a finite number or null")
+        return v
+
+
+class BatchReleaseRequest(BaseModel):
+    """Batch release verification request.
+
+    Stage 1 reuses the reconciliation rules exactly: the complete ``scan``
+    must agree well-by-well with the planned ``target`` layout — no missing
+    planned sample, no unplanned sample, no closed-loop (or open-chain)
+    misplacement and no blocked-well occupancy. Any disagreement yields 422
+    with the problem categories and the misplaced-well list; no release
+    conclusion is produced.
+
+    Stage 2 runs only after the scan matches, reusing the spatial QC
+    pipeline. The batch is released only when the polish converged, the
+    maximal row/column effect is at most ``max_spatial_effect`` and the
+    permutation p-value reaches ``min_p_value``. Any failed gate returns a
+    NOT_RELEASED verdict with the failing reason(s); no partial conclusion is
+    emitted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plate: PlateSpec = Field(default_factory=PlateSpec)
+    target: dict[str, str] = Field(
+        min_length=1, description="计划映射:样本 id → 计划孔位(原编排接口的 layout)"
+    )
+    scan: dict[str, str] = Field(
+        default_factory=dict, description="完整扫描:孔位 → 样本 id(空孔不列出)"
+    )
+    blocked_wells: list[str] = Field(default_factory=list)
+    samples: list[SpatialSample] = Field(
+        min_length=1, description="样本分组,每项 {id, group};应与计划样本一一对应"
+    )
+    readings: dict[str, Optional[float]] = Field(
+        default_factory=dict,
+        description="孔位 → 数值读数;省略孔位或显式 null 表示读数缺失",
+    )
+    seed: int = Field(default=0, ge=0, description="随机种子(≥0),控制组内置换")
+    max_spatial_effect: float = Field(
+        gt=0, description="空间效应上限:最大行列效应绝对值必须 ≤ 该值"
+    )
+    min_p_value: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="最低置换 p 值门槛(0–1);permutations=0 时无 p 值,该门无法通过",
+    )
+    permutations: int = Field(
+        default=1000, ge=0, le=1_000_000, description="组内置换次数(≥0,0 表示跳过置换)"
+    )
+    tolerance: float = Field(
+        default=1e-6, gt=0, description="收敛阈值:本轮最大行列校正量 ≤ tolerance 即收敛"
+    )
+    max_iterations: int = Field(
+        default=1000, ge=1, description="行列交替剥离的最大轮数"
+    )
+
+    @field_validator("max_spatial_effect")
+    @classmethod
+    def _max_effect_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("max_spatial_effect must be a finite number")
+        return v
 
     @field_validator("tolerance")
     @classmethod
