@@ -37,6 +37,11 @@ VIOLATION_SPATIAL_GROUP_INSUFFICIENT = "SPATIAL_GROUP_INSUFFICIENT"
 VIOLATION_SPATIAL_GRID_INSUFFICIENT = "SPATIAL_GRID_INSUFFICIENT"
 VIOLATION_SPATIAL_NOT_CONVERGED = "SPATIAL_NOT_CONVERGED"
 
+# Categories reported in 422 responses of the batch release endpoint when
+# the full scan does not agree with the planned layout.
+VIOLATION_SCAN_NOT_MATCHED = "SCAN_NOT_MATCHED"
+VIOLATION_CLOSED_LOOP_MISPLACEMENT = "CLOSED_LOOP_MISPLACEMENT"
+
 # Categories reported in 422 responses of the blinding endpoints.
 VIOLATION_BLIND_WELLS_DUPLICATED = "BLIND_WELLS_DUPLICATED"
 VIOLATION_BLIND_SAMPLE_WELL_MISMATCH = "BLIND_SAMPLE_WELL_MISMATCH"
@@ -178,6 +183,54 @@ class SpatialQCRequest(BaseModel):
         for well, value in v.items():
             if value is not None and not math.isfinite(value):
                 raise ValueError(f"reading at well '{well}' must be a finite number or null")
+        return v
+
+
+class ReleaseRequest(SpatialQCRequest):
+    """Batch release verification request.
+
+    Extends :class:`SpatialQCRequest` with the full plate ``scan``
+    (well → sample, empty wells omitted), ``blocked_wells`` and the two
+    acceptance gates. The service first checks the scan against the planned
+    ``layout`` with the same rules as the reconcile endpoint; only an exact
+    match proceeds to spatial QC, and release is granted solely when the
+    median polish converged, the maximal row/column effect is no greater
+    than ``max_spatial_effect`` and the permutation p-value is at least
+    ``min_p_value``. Any failure yields a non-released verdict without a
+    partial conclusion.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    blocked_wells: list[str] = Field(default_factory=list)
+    scan: dict[str, str] = Field(
+        default_factory=dict,
+        description="完整扫描映射:孔位 → 样本 id(空孔不列出),必须与计划 layout 完全一致",
+    )
+    max_spatial_effect: float = Field(
+        ...,
+        ge=0.0,
+        description="空间效应上限:最大行列效应绝对值必须 ≤ 此值才可放行",
+    )
+    min_p_value: float = Field(
+        ...,
+        gt=0.0,
+        le=1.0,
+        description="最低置换 p 值:经验 p 值必须 ≥ 此值才可放行",
+    )
+
+    @field_validator("max_spatial_effect")
+    @classmethod
+    def _max_effect_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("max_spatial_effect must be a finite number")
+        return v
+
+    @field_validator("min_p_value")
+    @classmethod
+    def _min_p_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("min_p_value must be a finite number")
         return v
 
 

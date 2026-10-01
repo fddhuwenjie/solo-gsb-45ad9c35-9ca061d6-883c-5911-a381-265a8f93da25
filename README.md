@@ -26,6 +26,7 @@ docker compose up --build
 - 编排接口： `POST http://localhost:8000/api/v1/arrangements`
 - 纠位接口： `POST http://localhost:8000/api/v1/arrangements/reconcile`
 - 空间质控接口： `POST http://localhost:8000/api/v1/arrangements/spatial-qc`
+- 批次放行核验： `POST http://localhost:8000/api/v1/arrangements/release`
 - 双人协作盲化： `POST http://localhost:8000/api/v1/blinding/blind`
 - 双人协作解盲： `POST http://localhost:8000/api/v1/blinding/unblind`
 
@@ -370,6 +371,168 @@ curl -X POST http://localhost:8000/api/v1/arrangements/spatial-qc \
 | `PLATE_DIMENSION_INVALID` | 板型尺寸非法 |
 | `REQUEST_VALIDATION_ERROR` | 请求体结构不合法（含 `NaN`/`Infinity` 读数等） |
 
+## 批次放行核验 `POST /api/v1/arrangements/release`
+
+对**已完成扫描的整板**做批次放行核验。服务先复用纠位接口的核对规则，
+确认**完整扫描与计划 layout 逐孔完全一致**；再复用空间质控流程，只有
+算法收敛、最大行列效应不超过给定上限、且置换 p 值达到最低门槛时才放行。
+**任一步失败都不给出可放行结论，也不输出部分结论。**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/arrangements/release \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plate": {"type": "24"},
+    "layout": {
+      "S1": "A1", "S2": "A2", "S3": "B1", "S4": "B2",
+      "S5": "C1", "S6": "C2", "S7": "D1", "S8": "D2"
+    },
+    "scan": {
+      "A1": "S1", "A2": "S2", "B1": "S3", "B2": "S4",
+      "C1": "S5", "C2": "S6", "D1": "S7", "D2": "S8"
+    },
+    "blocked_wells": ["D6"],
+    "samples": [
+      {"id": "S1", "group": "treated"}, {"id": "S2", "group": "control"},
+      {"id": "S3", "group": "treated"}, {"id": "S4", "group": "control"},
+      {"id": "S5", "group": "treated"}, {"id": "S6", "group": "control"},
+      {"id": "S7", "group": "treated"}, {"id": "S8", "group": "control"}
+    ],
+    "readings": {
+      "A1": 1.05, "A2": 0.98, "B1": 1.02, "B2": 1.01,
+      "C1": 1.04, "C2": 0.99, "D1": 1.03, "D2": 1.01
+    },
+    "seed": 42,
+    "permutations": 1000,
+    "tolerance": 0.000001,
+    "max_iterations": 1000,
+    "max_spatial_effect": 0.1,
+    "min_p_value": 0.05
+  }'
+```
+
+### 请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `plate` | object | 板型，与编排接口相同（默认 `"96"`) |
+| `layout` | object | 计划 layout：样本 id → 孔位（编排接口响应中的 `layout`) |
+| `scan` | object | 完整扫描：孔位 → 样本 id，**空孔不列出**，必须与计划逐孔一致 |
+| `blocked_wells[]` | array | 禁用孔位，扫描中不得有任何样本占用 |
+| `samples[]` | array | 样本列表，每项 `{id, group}`；与空间质控接口相同 |
+| `readings` | object | 孔位 → 数值读数；省略或显式 `null` 表示读数缺失 |
+| `seed` | int | 随机种子（≥0)，控制组内置换，默认 `0` |
+| `permutations` | int | 置换次数，默认 `1000`，范围 0–1,000,000;**`0` 时跳过置换，p 值门槛无法满足，必不放行** |
+| `tolerance` | float | 收敛阈值（>0)，默认 `1e-6` |
+| `max_iterations` | int | 行列剥离最大轮数，默认 `1000`(≥1) |
+| `max_spatial_effect` | float | **空间效应上限（必填，≥0)**：最大行列效应绝对值必须 `≤` 它 |
+| `min_p_value` | float | **最低置换 p 值（必填，(0,1])**：经验 p 值必须 `≥` 它 |
+
+### 处理流程
+
+1. **扫描核对（复用纠位规则）**：按纠位接口的全部预检查核对扫描与计划，
+   包括孔位合法性、扫描孔/样本重复、禁用孔占用、计划样本缺失（缺孔）、
+   计划外样本等；在预检查通过后再逐孔比对，识别**空孔链错位**与
+   **闭环错位**。只要存在任一不一致，立即返回 422，**不进行空间质控，
+   也不给出放行结论**。
+2. **空间质控（复用 spatial-qc)**：扫描完全吻合后，执行与空间质控接口
+   完全相同的组中位数中心化、行列中位数剥离与组内置换检验；该接口的
+   全部 422 条件（有效读数不足、网格过稀、未收敛等）原样生效，**不输出
+   任何效应、p 值或部分结论**。
+3. **放行门槛**：`converged = true` 且
+   `max_abs_row_col_effect ≤ max_spatial_effect` 且
+   `p_value ≥ min_p_value`（三个条件同时满足）才放行。
+
+### 放行响应（200,`status = "RELEASED"`)
+
+```json
+{
+  "status": "RELEASED",
+  "release": {
+    "released": true,
+    "gates": [
+      {"gate": "max_abs_row_col_effect", "passed": true,
+       "limit": 0.1, "observed": 0.02,
+       "rule": "observed max |row/column effect| must be <= limit"},
+      {"gate": "permutation_p_value", "passed": true,
+       "threshold": 0.05, "observed": 0.412587,
+       "rule": "permutation p-value must be >= threshold"}
+    ],
+    "reasons": []
+  },
+  "scan": {"matched": true, "occupied_wells": 8, "blocked_wells": ["D6"]},
+  "spatial_qc": { "...空间质控接口的完整 200 响应，逐字段一致...": "" }
+}
+```
+
+- `release.gates`：两道门槛的限值与实测值（效应上限、p 值门槛）。
+- `scan`：扫描核对摘要（完全吻合、占用孔数、禁用孔）。
+- `spatial_qc`：**空间质控接口响应原文**（`groups`/`effects`/`readings`/
+  `convergence`/`permutation_test` 等字段完全一致）。
+
+### 未放行（200,`status = "NOT_RELEASED"`)
+
+任一放行门槛失败时返回 200 与未放行结论，**只列失败原因与门槛实测值，
+不附扫描摘要与空间质控摘要（不输出部分结论）**:
+
+```json
+{
+  "status": "NOT_RELEASED",
+  "release": {
+    "released": false,
+    "gates": [
+      {"gate": "max_abs_row_col_effect", "passed": false,
+       "limit": 0.01, "observed": 0.02,
+       "rule": "observed max |row/column effect| must be <= limit"},
+      {"gate": "permutation_p_value", "passed": true,
+       "threshold": 0.05, "observed": 0.412587,
+       "rule": "permutation p-value must be >= threshold"}
+    ],
+    "reasons": ["max absolute row/column effect 0.02 exceeds the spatial effect limit 0.01"]
+  }
+}
+```
+
+`permutations = 0` 时 p 值不可评估，`permutation_p_value` 门槛判失败，
+原因中注明置换检验被跳过。
+
+### 扫描不一致（422，不给出放行结论）
+
+扫描与计划不一致时返回 422，在 `infeasibility_categories` 与 `messages`
+中列出全部问题类别，并在 `misplaced_wells` 中给出错孔清单（结构问题
+如缺孔、计划外样本时同样列出）、`cycles` 中列出闭环；响应中**没有
+`status`/`release`/`spatial_qc` 字段**:
+
+```json
+{
+  "detail": "The batch cannot be released; ... no partial conclusion was produced.",
+  "infeasibility_categories": ["SCAN_NOT_MATCHED", "CLOSED_LOOP_MISPLACEMENT"],
+  "messages": ["scan disagrees with the planned layout at 2 well(s); ...",
+               "closed-loop misplacement detected in 1 cycle(s): A1 -> A3"],
+  "misplaced_wells": [
+    {"well": "A1", "expected": "S1", "actual": "S3"},
+    {"well": "A3", "expected": "S3", "actual": "S1"}
+  ],
+  "cycles": [["A1", "A3"]]
+}
+```
+
+除各结构问题类别（`SAMPLES_MISSING`、`UNPLANNED_SAMPLES`、
+`BLOCKED_WELL_OCCUPIED`、`SCAN_SAMPLES_DUPLICATED`、
+`SCAN_WELLS_DUPLICATED`、`TARGET_WELLS_DUPLICATED`、
+`TARGET_ON_BLOCKED`、`WELL_REFERENCE_INVALID`、
+`PLATE_DIMENSION_INVALID`)，本接口另用：
+
+| 类别 | 含义 |
+| --- | --- |
+| `SCAN_NOT_MATCHED` | 存在错孔：缺孔（计划孔位为空）、样本出现在计划外孔位或孔位内容与计划不符 |
+| `CLOSED_LOOP_MISPLACEMENT` | 错孔中存在闭环（所有相关孔均被占用的循环错位，无空孔可直接归位） |
+
+空间质控阶段失败时，422 的 `infeasibility_categories` 直接使用空间质控
+接口的类别（如 `SPATIAL_NOT_CONVERGED`、`SPATIAL_GROUP_INSUFFICIENT`)。
+请求体结构错误（含 `NaN`/`Infinity`、缺门槛字段等）返回
+`REQUEST_VALIDATION_ERROR`。
+
 ## 双人协作盲化 `POST /api/v1/blinding/blind`
 
 为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
@@ -528,6 +691,9 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
 - 空间质控接口的组内置换使用 seed 初始化的独立确定性随机流，相同
   （输入， seed)（含 `permutations`/`tolerance`/`max_iterations`)
   必然得到逐位一致的效应、校正读数、收敛轨迹与 p 值。
+- 批次放行核验逐字复用上述扫描核对与空间质控流程，相同请求（含
+  `max_spatial_effect`/`min_p_value`）必然得到相同的错孔清单、
+  质控结果与放行结论。
 
 ## 配置（环境变量）
 
@@ -558,10 +724,11 @@ app/
   planner.py   三阶段字典序 CP-SAT 求解（平衡 → 邻接 → 确定性决胜）
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
   spatial_qc.py 组中位数中心化 + 行列中位数剥离（median polish）与组内置换检验
+  release.py   批次放行核验：扫描与计划逐孔一致 + 空间质控门槛全部达标才放行
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位、空间质控、盲化解盲）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控、放行核验、盲化解盲）
 Dockerfile     单容器构建
 docker-compose.yml  单命令启动
 ```

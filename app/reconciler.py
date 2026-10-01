@@ -27,6 +27,8 @@ staging well and back in).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from .planner import InfeasibleArrangement, _resolve_dimensions
 from .plates import parse_well, well_name
 from .schemas import (
@@ -68,7 +70,92 @@ class StagingConflict(Exception):
         super().__init__("closed-loop misplacements require a usable staging well")
 
 
-def _preflight(req: ReconcileRequest, rows: int, cols: int):
+@dataclass
+class ScanInspection:
+    """Result of cross-checking a full scan against the planned layout.
+
+    ``categories``/``messages`` collect every structural inconsistency
+    (duplicates, illegal wells, set disagreement, blocked occupancy...).
+    When the structural checks pass, ``misplaced_wells`` lists every well
+    whose observed content differs from the plan (including closed-loop and
+    open-chain displacement) and ``cycles`` lists the closed loops.
+    """
+
+    rows: int
+    columns: int
+    blocked: list[tuple[int, int]]
+    target_pos: dict[str, tuple[int, int]] = field(default_factory=dict)
+    scan_pos: dict[tuple[int, int], str] = field(default_factory=dict)
+    categories: list[str] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)
+    misplaced_wells: list[dict] = field(default_factory=list)
+    cycles: list[list[tuple[int, int]]] = field(default_factory=list)
+
+    @property
+    def matched(self) -> bool:
+        """True only when the scan agrees with the plan at every well."""
+        return not self.categories and not self.misplaced_wells
+
+
+def inspect_scan(req: ReconcileRequest) -> ScanInspection:
+    """Validate plate/scan structure and report every deviation from plan.
+
+    Unlike :func:`reconcile`, this never generates moves and never raises
+    for scan-vs-plan disagreement: callers (e.g. batch release) decide what
+    to do with the structural categories, the misplaced-well list and the
+    closed loops.
+    """
+    try:
+        rows, cols = _resolve_dimensions(req.plate)
+    except InfeasibleArrangement as exc:
+        return ScanInspection(
+            rows=0,
+            columns=0,
+            blocked=[],
+            categories=list(exc.categories),
+            messages=list(exc.messages),
+        )
+
+    blocked, target_pos, scan_pos, categories, messages = _preflight(
+        req, rows, cols, raise_on_error=False
+    )
+    inspection = ScanInspection(
+        rows=rows,
+        columns=cols,
+        blocked=sorted(blocked),
+        target_pos=target_pos,
+        scan_pos=scan_pos,
+        categories=categories,
+        messages=messages,
+    )
+
+    # Well-level diff vs. the plan, built from the raw parsed mappings so it
+    # is reported even when the sample sets disagree (missing wells,
+    # unplanned samples) or a target well is duplicated.
+    def expected_at(pos: tuple[int, int]):
+        for sid, tpos in target_pos.items():
+            if tpos == pos:
+                return sid
+        return None
+
+    for pos in sorted(set(target_pos.values()) | set(scan_pos)):
+        expected, actual = expected_at(pos), scan_pos.get(pos)
+        if expected != actual:
+            inspection.misplaced_wells.append(
+                {"well": well_name(*pos), "expected": expected, "actual": actual}
+            )
+
+    # Cycles are meaningful only when the mappings are structurally sound
+    # (well-formed and identical sample set).
+    if not categories:
+        _need, _chains, cycles = _decompose(target_pos, scan_pos)
+        inspection.cycles = cycles
+
+    return inspection
+
+
+def _preflight(req: ReconcileRequest, rows: int, cols: int,
+               raise_on_error: bool = True):
     """Cross-check target, scan and blocked wells before any planning."""
     categories: list[str] = []
     messages: list[str] = []
@@ -158,10 +245,10 @@ def _preflight(req: ReconcileRequest, rows: int, cols: int):
             f"scanned sample(s) not in the plan: {', '.join(unplanned)}",
         )
 
-    if categories:
+    if categories and raise_on_error:
         raise ReconcileInvalid(categories, messages)
 
-    return blocked, target_pos, scan_pos
+    return blocked, target_pos, scan_pos, categories, messages
 
 
 def _decompose(target_pos: dict[str, tuple[int, int]],
@@ -299,7 +386,9 @@ def reconcile(req: ReconcileRequest) -> dict:
     except InfeasibleArrangement as exc:
         raise ReconcileInvalid(exc.categories, exc.messages) from exc
 
-    blocked, target_pos, scan_pos = _preflight(req, rows, cols)
+    blocked, target_pos, scan_pos, _categories, _messages = _preflight(
+        req, rows, cols
+    )
     need, chains, cycles = _decompose(target_pos, scan_pos)
     staging_pos = _check_staging(req, rows, cols, blocked, need, scan_pos, cycles)
     moves = _plan_moves(scan_pos, chains, cycles, staging_pos)
